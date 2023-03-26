@@ -1,93 +1,90 @@
 package api
 
 import (
-	_ "embed"
-	"fmt"
-	"net/http"
-	"os/exec"
+  "fmt"
+  "github.com/m1k1o/go-transcode/pkg/hls"
+  "github.com/rs/zerolog/log"
+  "os"
+  "os/exec"
+  "path"
 
-	"github.com/go-chi/chi"
-	"github.com/rs/zerolog/log"
-
-	"github.com/m1k1o/go-transcode/hls"
+  "github.com/m1k1o/go-transcode/internal/config"
 )
 
 var hlsManagers map[string]hls.Manager = make(map[string]hls.Manager)
 
-//go:embed play.html
-var playHTML string
+type HlsManagerCtx struct {
+  config *config.Server
+}
 
-func (a *ApiManagerCtx) HLS(r chi.Router) {
-	r.Get("/{profile}/{input}/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
-		logger := log.With().Str("module", "hls").Logger()
+func New(config *config.Server) *HlsManagerCtx {
+  return &HlsManagerCtx{
+    config: config,
+  }
+}
 
-		profile := chi.URLParam(r, "profile")
-		input := chi.URLParam(r, "input")
+func (manager *HlsManagerCtx) Start() {
+  lp := manager.config.LiveProfiles
+  rdisk := manager.config.RamDisk
+  for _, s := range manager.config.Streams {
+    for _, p := range lp {
+      pp, err := manager.ProfilePath("hls", p)
+      if err != nil {
+        log.Warn().Err(err).Msg("转码模板脚本不存在!")
+        return
+      }
+      ID := fmt.Sprintf("%s_%s", pp, s)
+      runPath := fmt.Sprintf("%s/%s/%s", rdisk, "/", ID)
 
-		if !resourceRegex.MatchString(profile) || !resourceRegex.MatchString(input) {
-			http.Error(w, "400 invalid parameters", http.StatusBadRequest)
-			return
-		}
+      hlsm, ok := hlsManagers[ID]
+      if !ok {
+        // create new manager
+        hlsm = hls.New(func() *exec.Cmd {
+          // get transcode cmd
+          cmd, err := manager.transcodeStart(pp, s)
+          if err != nil {
+            log.Error().Err(err).Msg("启动转码进程失败")
+          }
+          return cmd
+        })
+        hlsm.SetRunPath(runPath)
+        err := hlsm.Start()
+        if err != nil {
+          log.Warn().Err(err).Str("profilePath", pp).Str("url", s).Msg("转码命令启动失败！")
+          return
+        }
+        hlsManagers[ID] = hlsm
+      }
+    }
+  }
+}
 
-		// check if stream exists
-		_, ok := a.config.Streams[input]
-		if !ok {
-			http.Error(w, "404 stream not found", http.StatusNotFound)
-			return
-		}
+func (manager *HlsManagerCtx) Shutdown() error {
+  // stop all hls managers
+  for _, hlsm := range hlsManagers {
+    hlsm.Stop()
+  }
+  return nil
+}
 
-		// check if profile exists
-		profilePath, err := a.ProfilePath("hls", profile)
-		if err != nil {
-			logger.Warn().Err(err).Msg("profile path could not be found")
-			http.Error(w, "404 profile not found", http.StatusNotFound)
-			return
-		}
+func (manager *HlsManagerCtx) ProfilePath(folder string, profile string) (string, error) {
 
-		ID := fmt.Sprintf("%s/%s", profile, input)
+  profilePath := path.Join(manager.config.Profiles, folder, fmt.Sprintf("%s.sh", profile))
+  if _, err := os.Stat(profilePath); os.IsNotExist(err) {
+    log.Info().Str("profilepath", profilePath).Msg("脚本文件不存在！")
+    return "", err
+  }
+  return profilePath, nil
+}
 
-		manager, ok := hlsManagers[ID]
-		if !ok {
-			// create new manager
-			manager = hls.New(func() *exec.Cmd {
-				// get transcode cmd
-				cmd, err := a.transcodeStart(profilePath, input)
-				if err != nil {
-					logger.Error().Err(err).Msg("transcode could not be started")
-				}
+// Call ProfilePath before
+func (a *HlsManagerCtx) transcodeStart(profilePath string, input string) (*exec.Cmd, error) {
+  url, ok := a.config.Streams[input]
+  if !ok {
+    return nil, fmt.Errorf("stream not found")
+  }
 
-				return cmd
-			})
+  log.Info().Str("profilePath", profilePath).Str("url", url).Msg("转码开始!")
 
-			hlsManagers[ID] = manager
-		}
-
-		manager.ServePlaylist(w, r)
-	})
-
-	r.Get("/{profile}/{input}/{file}.ts", func(w http.ResponseWriter, r *http.Request) {
-		profile := chi.URLParam(r, "profile")
-		input := chi.URLParam(r, "input")
-		file := chi.URLParam(r, "file")
-
-		if !resourceRegex.MatchString(profile) || !resourceRegex.MatchString(input) || !resourceRegex.MatchString(file) {
-			http.Error(w, "400 invalid parameters", http.StatusBadRequest)
-			return
-		}
-
-		ID := fmt.Sprintf("%s/%s", profile, input)
-
-		manager, ok := hlsManagers[ID]
-		if !ok {
-			http.Error(w, "404 transcode not found", http.StatusNotFound)
-			return
-		}
-
-		manager.ServeMedia(w, r)
-	})
-
-	r.Get("/{profile}/{input}/play.html", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(playHTML))
-	})
+  return exec.Command(profilePath, url), nil
 }

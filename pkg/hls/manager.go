@@ -3,10 +3,8 @@ package hls
 import (
 	"errors"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"sync"
 	"syscall"
 	"time"
@@ -47,21 +45,21 @@ type ManagerCtx struct {
 	tempdir     string
 	lastRequest time.Time
 
-	sequence int
-	playlist string
-
-	playlistLoad chan string
-	shutdown     chan interface{}
+	shutdown chan interface{}
 }
 
 func New(cmdFactory func() *exec.Cmd) *ManagerCtx {
 	return &ManagerCtx{
 		logger:     log.With().Str("module", "hls").Str("submodule", "manager").Logger(),
 		cmdFactory: cmdFactory,
-
-		playlistLoad: make(chan string),
-		shutdown:     make(chan interface{}),
+		shutdown:   make(chan interface{}),
 	}
+}
+
+func (m *ManagerCtx) SetRunPath(cmdPath string) error {
+	err := os.MkdirAll(cmdPath, 0777)
+	m.tempdir = cmdPath
+	return err
 }
 
 func (m *ManagerCtx) Start() error {
@@ -72,13 +70,9 @@ func (m *ManagerCtx) Start() error {
 		return errors.New("has already started")
 	}
 
-	m.logger.Debug().Msg("performing start")
+	m.logger.Debug().Msg("开始启动程序......")
 
 	var err error
-	m.tempdir, err = os.MkdirTemp("", "go-transcode-hls")
-	if err != nil {
-		return err
-	}
 
 	m.cmd = m.cmdFactory()
 	m.cmd.Dir = m.tempdir
@@ -89,7 +83,7 @@ func (m *ManagerCtx) Start() error {
 		m.cmd.Stderr = utils.LogWriter(m.logger)
 	}
 
-	read, write := io.Pipe()
+	_, write := io.Pipe()
 	m.cmd.Stdout = write
 
 	// create a new process group
@@ -97,58 +91,7 @@ func (m *ManagerCtx) Start() error {
 
 	m.active = false
 	m.lastRequest = time.Now()
-
-	m.sequence = 0
-	m.playlist = ""
-
-	m.playlistLoad = make(chan string)
 	m.shutdown = make(chan interface{})
-
-	// read playlist on stdout
-	go func() {
-		buf := make([]byte, 1024)
-
-		for {
-			n, err := read.Read(buf)
-			if n != 0 {
-				m.playlist = string(buf[:n])
-				m.sequence = m.sequence + 1
-
-				m.logger.Info().
-					Int("sequence", m.sequence).
-					Str("playlist", m.playlist).
-					Msg("received playlist")
-
-				if m.sequence == hlsMinimumSegments {
-					m.active = true
-					m.playlistLoad <- m.playlist
-					close(m.playlistLoad)
-				}
-			}
-
-			// if stdout pipe has been closed
-			if err != nil {
-				m.logger.Err(err).Msg("cmd read failed")
-				return
-			}
-		}
-	}()
-
-	// periodic cleanup
-	go func() {
-		ticker := time.NewTicker(cleanupPeriod)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-m.shutdown:
-				write.Close()
-				return
-			case <-ticker.C:
-				m.Cleanup()
-			}
-		}
-	}()
 
 	if m.events.onStart != nil {
 		m.events.onStart()
@@ -169,10 +112,10 @@ func (m *ManagerCtx) Start() error {
 				// defined for both Unix and Windows and in both cases has
 				// an ExitStatus() method with the same signature.
 				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-					m.logger.Warn().Int("exit-status", status.ExitStatus()).Msg("the program has exited with an exit code != 0")
+					m.logger.Warn().Int("exit-status", status.ExitStatus()).Msg("转码脚本执行时返回非0码!")
 				}
 			} else {
-				m.logger.Err(err).Msg("the program has exited with an error")
+				m.logger.Err(err).Msg("转码脚本执行时错误退出了！")
 			}
 		} else {
 			m.logger.Info().Msg("the program has successfully exited")
@@ -185,7 +128,7 @@ func (m *ManagerCtx) Start() error {
 		}
 
 		err := os.RemoveAll(m.tempdir)
-		m.logger.Err(err).Msg("removing tempdir")
+		m.logger.Err(err).Msg("清理临时文件......")
 
 		m.mu.Lock()
 		m.cmd = nil
@@ -230,61 +173,6 @@ func (m *ManagerCtx) Cleanup() {
 	if stop {
 		m.Stop()
 	}
-}
-
-func (m *ManagerCtx) ServePlaylist(w http.ResponseWriter, r *http.Request) {
-	m.mu.Lock()
-	m.lastRequest = time.Now()
-	m.mu.Unlock()
-
-	playlist := m.playlist
-
-	if m.cmd == nil {
-		err := m.Start()
-		if err != nil {
-			m.logger.Warn().Err(err).Msg("transcode could not be started")
-			http.Error(w, "500 not available", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if !m.active {
-		select {
-		case playlist = <-m.playlistLoad:
-		// when command exits before providing any playlist
-		case <-m.shutdown:
-			m.logger.Warn().Msg("playlist load failed because of shutdown")
-			http.Error(w, "500 playlist not available", http.StatusInternalServerError)
-			return
-		case <-time.After(playlistTimeout):
-			m.logger.Warn().Msg("playlist load channel timeouted")
-			http.Error(w, "504 playlist timeout", http.StatusGatewayTimeout)
-			return
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write([]byte(playlist))
-}
-
-func (m *ManagerCtx) ServeMedia(w http.ResponseWriter, r *http.Request) {
-	fileName := path.Base(r.URL.RequestURI())
-	path := path.Join(m.tempdir, fileName)
-
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		m.logger.Warn().Str("path", path).Msg("media file not found")
-		http.Error(w, "404 media not found", http.StatusNotFound)
-		return
-	}
-
-	m.mu.Lock()
-	m.lastRequest = time.Now()
-	m.mu.Unlock()
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-cache")
-	http.ServeFile(w, r, path)
 }
 
 func (m *ManagerCtx) OnStart(event func()) {

@@ -11,4 +11,5 @@ exec ffmpeg -hide_banner -loglevel warning \
     -hls_delete_threshold 1 \
     -hls_flags delete_segments \
     -hls_start_number_source datetime \
-    -hls_segment_filename "live_%03d.ts" -
+    -hls_segment_filename "${2}/live_%03d.ts" \
+    "${2}/index.m3u8" -
