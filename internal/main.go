@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"github.com/m1k1o/go-transcode/pkg/hclient"
 	"os"
 	"os/signal"
 
@@ -17,16 +18,18 @@ var Service *Main
 func init() {
 	Service = &Main{
 		RootConfig:   &config.Root{},
-		ServerConfig: &config.Server{},
+		ServerConfig: &config.HtsServer{},
 	}
 }
 
 type Main struct {
 	RootConfig   *config.Root
-	ServerConfig *config.Server
+	ServerConfig *config.HtsServer
 
 	logger     zerolog.Logger
 	hlsManager *api.HlsManagerCtx
+	hClient    *hclient.ClientCtx
+	channels   map[string]string
 }
 
 func (main *Main) Preflight() {
@@ -35,8 +38,13 @@ func (main *Main) Preflight() {
 
 func (main *Main) Start() {
 	config := main.ServerConfig
+
 	main.hlsManager = api.New(config)
+
 	main.hlsManager.Start()
+
+	main.hClient = hclient.New(config)
+	main.channels, _ = main.hClient.GetChannels("https://127.0.0.1:8888/base/getchns")
 
 }
 
